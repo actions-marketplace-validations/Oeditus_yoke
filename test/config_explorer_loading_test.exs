@@ -313,6 +313,214 @@ defmodule Yoke.CLI.ConfigExplorerLoadingTest do
     assert page2_out =~ "Conversations: 4-6 of 7 (Page 2/3)"
   end
 
+  test "default loading does not time out slow categories" do
+    test = self()
+
+    loader = fn
+      :sessions, _, _ ->
+        send(test, {:sessions_started, self()})
+        receive do: (:finish -> %{sessions: [%{id: "slow_ok"}], sessions_total: 1})
+
+      _, _, _ ->
+        %{}
+    end
+
+    state = ConfigExplorer.new_state(".", loader: loader) |> ConfigExplorer.start_loading()
+    on_exit(fn -> ConfigExplorer.cancel_loading(state) end)
+    ref = state.load_ref
+
+    assert_receive {:sessions_started, worker_pid}
+    Process.sleep(60)
+    assert Process.alive?(worker_pid)
+    refute_receive {:explorer_load, ^ref, :sessions, {:error, _}}, 20
+
+    send(worker_pid, :finish)
+    assert_receive {:explorer_load, ^ref, :sessions, {:ok, %{sessions: [%{id: "slow_ok"}]}}}
+  end
+
+  test "parse_session_metadata reads listing.json header and avoids decoding large legacy files" do
+    cwd = Path.join(System.tmp_dir!(), "explorer_meta_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(cwd)
+    on_exit(fn -> File.rm_rf!(cwd) end)
+
+    modern_path = Path.join(cwd, "modern.lmml")
+
+    File.write!(modern_path, """
+    # Yoke Conversation: modern
+
+    @@@listing.json
+    {"message_count":42,"model":"deepseek-v4","schema_version":1,"session_id":"modern","step_count":10,"title":"Ship the pager","updated_at":"2026-11-25T10:00:00Z"}
+    @@@
+
+    @@@manifest.json
+    {"model":"wrong-if-decoded"}
+    @@@
+    """)
+
+    assert %{model: "deepseek-v4", msg_count: 42, preview: "Ship the pager"} =
+             ConfigExplorer.parse_session_metadata(modern_path)
+
+    large_legacy_path = Path.join(cwd, "legacy_big.lmml")
+    padding = String.duplicate("x", 600_000)
+
+    File.write!(
+      large_legacy_path,
+      """
+      # Yoke Conversation: legacy_big
+
+      @@@manifest.json
+      {"model":"legacy-model","session_id":"legacy_big"}
+      @@@
+
+      ## USER
+
+      First prompt in large legacy file
+
+      #{padding}
+      """
+    )
+
+    assert %{model: "legacy-model", msg_count: 1, preview: "First prompt in large legacy file"} =
+             ConfigExplorer.parse_session_metadata(large_legacy_path)
+  end
+
+  test "load_sessions_page cancels superseded page worker and cleans up on cancel_loading" do
+    test = self()
+
+    loader = fn :sessions, _, opts ->
+      send(test, {:page_worker, Keyword.get(opts, :sessions_offset), self()})
+      Process.sleep(:infinity)
+    end
+
+    state = ConfigExplorer.new_state(".", loader: loader, sessions_page_size: 5)
+    state = ConfigExplorer.load_sessions_page(state, 5)
+    assert_receive {:page_worker, 5, worker1}
+    mon1 = Process.monitor(worker1)
+
+    state = ConfigExplorer.load_sessions_page(state, 10)
+    assert_receive {:DOWN, ^mon1, :process, ^worker1, _}
+    assert_receive {:page_worker, 10, worker2}
+    mon2 = Process.monitor(worker2)
+
+    assert :ok = ConfigExplorer.cancel_loading(state)
+    assert_receive {:DOWN, ^mon2, :process, ^worker2, _}
+  end
+
+  test "conversations default to current project, toggle Show All, and render Project column" do
+    root = Path.join(System.tmp_dir!(), "explorer_projects_#{System.unique_integer([:positive])}")
+    proj_a = Path.join(root, "alpha_app")
+    proj_b = Path.join(root, "beta_service")
+    global_dir = Path.join(root, "global_sessions")
+    registry_path = Path.join(root, "projects.json")
+
+    File.mkdir_p!(Path.join(proj_a, ".yoke/sessions"))
+    File.mkdir_p!(Path.join(proj_b, ".yoke/sessions"))
+    File.mkdir_p!(global_dir)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    File.write!(Path.join(proj_a, ".yoke/sessions/sess_a.lmml"), """
+    @@@manifest.json
+    {"session_id":"sess_a","model":"deepseek-chat","messages":[{"role":"user","content":"Alpha work"}]}
+    @@@
+
+    # User
+    Alpha work
+    """)
+
+    File.write!(Path.join(proj_b, ".yoke/sessions/sess_b.lmml"), """
+    @@@manifest.json
+    {"session_id":"sess_b","model":"deepseek-chat","messages":[{"role":"user","content":"Beta work"}]}
+    @@@
+
+    # User
+    Beta work
+    """)
+
+    File.write!(Path.join(global_dir, "sess_g.lmml"), """
+    @@@manifest.json
+    {"session_id":"sess_g","model":"deepseek-chat","messages":[{"role":"user","content":"Global work"}]}
+    @@@
+
+    # User
+    Global work
+    """)
+
+    assert :ok =
+             Yoke.Brain.SessionStore.register_project_dir(proj_a, registry_path: registry_path)
+
+    assert :ok =
+             Yoke.Brain.SessionStore.register_project_dir(proj_b, registry_path: registry_path)
+
+    opts = [
+      global_sessions_dir: global_dir,
+      projects_registry_path: registry_path
+    ]
+
+    # Default: current project only
+    default_files = ConfigExplorer.list_session_files(proj_a, opts)
+    assert [%{id: "sess_a", project: "alpha_app"}] = default_files
+
+    state =
+      ConfigExplorer.new_state(proj_a, opts)
+      |> ConfigExplorer.switch_tab(2)
+      |> ConfigExplorer.start_loading()
+
+    on_exit(fn -> ConfigExplorer.cancel_loading(state) end)
+    ref = state.load_ref
+    assert state.show_all_sessions? == false
+
+    assert_receive {:explorer_load, ^ref, :sessions, {:ok, project_only}}
+    assert [%{id: "sess_a", project: "alpha_app"}] = project_only.sessions
+
+    state =
+      ConfigExplorer.apply_load_result(
+        state,
+        {:explorer_load, ref, :sessions, {:ok, project_only}}
+      )
+
+    project_output =
+      ExUnit.CaptureIO.capture_io(:user, fn ->
+        ConfigExplorer.render_full_screen(state)
+      end)
+
+    assert project_output =~ "Show All"
+    assert project_output =~ "Project"
+    assert project_output =~ "alpha_app"
+    refute project_output =~ "beta_service"
+    refute project_output =~ "sess_g"
+
+    # Toggle Show All -> includes current project, registered projects, and global sessions
+    state = ConfigExplorer.toggle_show_all_sessions(state)
+    assert state.show_all_sessions? == true
+    assert_receive {:explorer_load, ^ref, :sessions, {:ok, all_page}}
+
+    assert Enum.sort_by(all_page.sessions, & &1.id)
+           |> Enum.map(&{&1.id, &1.project}) == [
+             {"sess_a", "alpha_app"},
+             {"sess_b", "beta_service"},
+             {"sess_g", "global"}
+           ]
+
+    state =
+      ConfigExplorer.apply_load_result(state, {:explorer_load, ref, :sessions, {:ok, all_page}})
+
+    all_output =
+      ExUnit.CaptureIO.capture_io(:user, fn ->
+        ConfigExplorer.render_full_screen(state)
+      end)
+
+    assert all_output =~ "Show All: ON"
+    assert all_output =~ "alpha_app"
+    assert all_output =~ "beta_service"
+    assert all_output =~ "global"
+
+    # Toggle back -> current project only
+    state = ConfigExplorer.toggle_show_all_sessions(state)
+    assert state.show_all_sessions? == false
+    assert_receive {:explorer_load, ^ref, :sessions, {:ok, back_to_project}}
+    assert [%{id: "sess_a", project: "alpha_app"}] = back_to_project.sessions
+  end
+
   defp receive_worker do
     receive do
       {:worker, tab, pid} -> {tab, pid}

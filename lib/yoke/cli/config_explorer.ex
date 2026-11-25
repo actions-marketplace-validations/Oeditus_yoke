@@ -15,6 +15,8 @@ defmodule Yoke.CLI.ConfigExplorer do
   """
   alias Yoke.BashTracker
   alias Yoke.Brain.SessionLmml
+  alias Yoke.Brain.SessionMetadata
+  alias Yoke.Brain.SessionStore
   alias Yoke.CLI.Formatter
   alias Yoke.CLI.LineEditor
   alias Yoke.CLI.TerminalOwner
@@ -46,8 +48,10 @@ defmodule Yoke.CLI.ConfigExplorer do
 
   Options:
 
-    * `:include_global?` - when `false`, only the workspace `.yoke` directory is
-      scanned for sessions. Defaults to `true`.
+    * `:show_all_sessions?` - when `true`, scans the current project's `.yoke/sessions`,
+      global `~/.yoke/sessions`, and known projects' `.yoke/sessions`. Defaults to `false`
+      (current project only).
+    * `:include_global?` - legacy alias for `:show_all_sessions?`. Defaults to `false`.
   """
   def scan_directory_tree(cwd \\ ".", opts \\ []) do
     local_dir = Path.join(cwd, ".yoke")
@@ -84,7 +88,7 @@ defmodule Yoke.CLI.ConfigExplorer do
     owner = self()
     ref = make_ref()
     loader = Keyword.get(state.load_options, :loader, &load_category/3)
-    timeout = Keyword.get(state.load_options, :load_timeout, 5_000)
+    timeout = Keyword.get(state.load_options, :load_timeout, :infinity)
 
     pid =
       spawn(fn ->
@@ -100,11 +104,12 @@ defmodule Yoke.CLI.ConfigExplorer do
                 worker_opts =
                   if tab == :sessions do
                     state.load_options
-                    |> Keyword.put_new(:sessions_offset, Map.get(state.tree, :sessions_offset, 0))
-                    |> Keyword.put_new(
-                      :sessions_page_size,
-                      Map.get(state.tree, :sessions_page_size, default_sessions_page_size())
+                    |> Keyword.put(
+                      :show_all_sessions?,
+                      Map.get(state, :show_all_sessions?, false)
                     )
+                    |> Keyword.put_new(:sessions_offset, Map.get(state.tree, :sessions_offset, 0))
+                    |> Keyword.put_new(:sessions_page_size, current_sessions_page_size(state))
                   else
                     state.load_options
                   end
@@ -121,50 +126,86 @@ defmodule Yoke.CLI.ConfigExplorer do
                 send(coordinator, {:loaded, self(), tab, result})
               end)
 
-            timer = Process.send_after(self(), {:timeout, worker, tab}, timeout)
+            timer =
+              if is_integer(timeout) and timeout > 0 do
+                Process.send_after(self(), {:timeout, worker, tab}, timeout)
+              else
+                nil
+              end
+
             {worker, {tab, timer}}
           end)
 
         loading_loop(owner, owner_ref, ref, workers)
       end)
 
-    %{state | load_ref: ref, loader_pid: pid, loading: Map.new(@tabs, &{&1, :loading})}
+    %{
+      state
+      | load_ref: ref,
+        loader_pid: pid,
+        sessions_loader_pid: nil,
+        loading: Map.new(@tabs, &{&1, :loading})
+    }
   end
 
   @doc false
   def load_sessions_page(state, new_offset) do
+    cancel_pid(Map.get(state, :sessions_loader_pid))
     owner = self()
     ref = state.load_ref || make_ref()
     loader = Keyword.get(state.load_options, :loader, &load_category/3)
-    page_size = Map.get(state.tree, :sessions_page_size, default_sessions_page_size())
+    page_size = current_sessions_page_size(state)
     offset = max(0, new_offset)
 
     worker_opts =
       state.load_options
+      |> Keyword.put(:show_all_sessions?, Map.get(state, :show_all_sessions?, false))
       |> Keyword.put(:sessions_offset, offset)
       |> Keyword.put(:sessions_page_size, page_size)
 
-    spawn(fn ->
-      result =
-        try do
-          {:ok, loader.(:sessions, state.cwd, worker_opts)}
-        rescue
-          error -> {:error, Exception.message(error)}
-        catch
-          kind, reason -> {:error, inspect({kind, reason})}
-        end
+    pid =
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
+        owner_ref = Process.monitor(owner)
+        coordinator = self()
 
-      send(owner, {:explorer_load, ref, :sessions, result})
-    end)
+        worker =
+          spawn_link(fn ->
+            result =
+              try do
+                {:ok, loader.(:sessions, state.cwd, worker_opts)}
+              rescue
+                error -> {:error, Exception.message(error)}
+              catch
+                kind, reason -> {:error, inspect({kind, reason})}
+              end
+
+            send(coordinator, {:loaded, self(), :sessions, result})
+          end)
+
+        loading_loop(owner, owner_ref, ref, %{worker => {:sessions, nil}})
+      end)
 
     %{
       state
       | load_ref: ref,
+        sessions_loader_pid: pid,
         cursor: 0,
         detail_scroll: 0,
         status_notice: nil,
         loading: Map.put(state.loading, :sessions, :loading)
     }
+  end
+
+  @doc "Toggles between current-project conversations and all conversations across projects."
+  def toggle_show_all_sessions(state) do
+    new_show_all? = not Map.get(state, :show_all_sessions?, false)
+    updated = %{state | show_all_sessions?: new_show_all?}
+    load_sessions_page(updated, 0)
+  end
+
+  defp show_all_sessions_opt(opts) do
+    Keyword.get(opts, :show_all_sessions?, Keyword.get(opts, :include_global?, false))
   end
 
   defp sessions_has_prev?(%{tree: tree}), do: Map.get(tree, :sessions_offset, 0) > 0
@@ -174,18 +215,43 @@ defmodule Yoke.CLI.ConfigExplorer do
       Map.get(tree, :sessions_total, 0)
   end
 
+  defp can_page_sessions?(%{active_tab: :sessions, view_mode: :list} = state, direction) do
+    Map.get(state.loading, :sessions) == :ready and
+      case direction do
+        :prev -> sessions_has_prev?(state)
+        :next -> sessions_has_next?(state)
+      end
+  end
+
+  defp can_page_sessions?(_state, _direction), do: false
+
   defp page_sessions(state, :next) do
-    page_size = Map.get(state.tree, :sessions_page_size, default_sessions_page_size())
+    page_size = current_sessions_page_size(state)
     load_sessions_page(state, Map.get(state.tree, :sessions_offset, 0) + page_size)
   end
 
   defp page_sessions(state, :prev) do
-    page_size = Map.get(state.tree, :sessions_page_size, default_sessions_page_size())
+    page_size = current_sessions_page_size(state)
     load_sessions_page(state, max(0, Map.get(state.tree, :sessions_offset, 0) - page_size))
   end
 
+  defp current_sessions_page_size(state) do
+    case Keyword.get(state.load_options, :sessions_page_size) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> default_sessions_page_size()
+    end
+  end
+
   @doc false
-  def cancel_loading(%{loader_pid: pid}) when is_pid(pid) do
+  def cancel_loading(state) when is_map(state) do
+    cancel_pid(Map.get(state, :loader_pid))
+    cancel_pid(Map.get(state, :sessions_loader_pid))
+    :ok
+  end
+
+  def cancel_loading(_state), do: :ok
+
+  defp cancel_pid(pid) when is_pid(pid) do
     monitor = Process.monitor(pid)
     Process.exit(pid, :kill)
 
@@ -194,7 +260,7 @@ defmodule Yoke.CLI.ConfigExplorer do
     end
   end
 
-  def cancel_loading(_state), do: :ok
+  defp cancel_pid(_), do: :ok
 
   defp loading_loop(_owner, _owner_ref, _ref, workers) when map_size(workers) == 0,
     do: :ok
@@ -228,7 +294,7 @@ defmodule Yoke.CLI.ConfigExplorer do
         loading_loop(owner, owner_ref, ref, workers)
 
       {{^tab, timer}, remaining} ->
-        Process.cancel_timer(timer)
+        if is_reference(timer), do: Process.cancel_timer(timer)
         send(owner, {:explorer_load, ref, tab, result})
         loading_loop(owner, owner_ref, ref, remaining)
     end
@@ -274,7 +340,7 @@ defmodule Yoke.CLI.ConfigExplorer do
     sessions =
       all_files
       |> Enum.slice(offset, page_size)
-      |> Enum.map(&Map.merge(&1, parse_session_metadata(&1.path)))
+      |> Enum.map(&merge_session_metadata(&1, parse_session_metadata(&1.path)))
 
     %{
       sessions: sessions,
@@ -292,6 +358,18 @@ defmodule Yoke.CLI.ConfigExplorer do
   defp load_category(:analytics, cwd, _opts),
     do: %{analytics: read_bash_analytics(cwd), patterns: list_review_patterns(cwd)}
 
+  defp merge_session_metadata(item, meta) do
+    merged = Map.merge(item, meta)
+
+    case Map.get(meta, :project) do
+      project when is_binary(project) and project != "" ->
+        Map.put(merged, :project, project)
+
+      _ ->
+        Map.put(merged, :project, Map.get(item, :project, "unknown"))
+    end
+  end
+
   defp sessions_page_size(opts) do
     case Keyword.get(opts, :sessions_page_size) do
       n when is_integer(n) and n > 0 -> n
@@ -301,28 +379,59 @@ defmodule Yoke.CLI.ConfigExplorer do
 
   defp default_sessions_page_size do
     {_cols, rows} = terminal_dimensions()
-    max(5, rows - 6)
+    max(5, rows - 8)
   end
 
   @doc """
-  Lists session files from the workspace `.yoke/sessions` directory and the
-  global `~/.yoke/sessions` directory, newest first.
+  Lists session files newest first, tagging each entry with the `:project` it
+  belongs to.
 
-  Pass `include_global?: false` to scan only the workspace directory. Tests
-  use this to stay hermetic: the global directory lives in the developer's
-  real `$HOME`, so including it makes results depend on unrelated local
-  state.
+  By default, only the current workspace's `.yoke/sessions` directory is
+  scanned. Pass `show_all_sessions?: true` (or `include_global?: true`) to also
+  include the global `~/.yoke/sessions` directory and any known projects
+  registered in `~/.yoke/projects.json` (plus `:extra_project_dirs`).
   """
   def list_session_files(cwd \\ ".", opts \\ []) do
-    dirs =
-      if Keyword.get(opts, :include_global?, true) do
-        [Path.join(cwd, ".yoke/sessions"), Path.expand("~/.yoke/sessions")]
+    show_all? = show_all_sessions_opt(opts)
+    expanded_cwd = Path.expand(cwd)
+    current_project = SessionMetadata.project_name_for_cwd(expanded_cwd)
+    local_dir = Path.join(cwd, ".yoke/sessions")
+
+    sources =
+      if show_all? do
+        global_sessions_dir =
+          Keyword.get(opts, :global_sessions_dir, Path.expand("~/.yoke/sessions"))
+
+        registry_opts =
+          case Keyword.fetch(opts, :projects_registry_path) do
+            {:ok, path} -> [registry_path: path]
+            :error -> []
+          end
+
+        known_projects =
+          SessionStore.known_project_dirs(registry_opts) ++
+            Keyword.get(opts, :extra_project_dirs, [])
+
+        known_sources =
+          Enum.map(known_projects, fn proj_dir ->
+            expanded_proj = Path.expand(proj_dir)
+
+            {SessionMetadata.project_name_for_cwd(expanded_proj), expanded_proj,
+             Path.join(expanded_proj, ".yoke/sessions")}
+          end)
+
+        [
+          {current_project, expanded_cwd, local_dir},
+          {"global", Path.expand("~"), Path.expand(global_sessions_dir)}
+          | known_sources
+        ]
       else
-        [Path.join(cwd, ".yoke/sessions")]
+        [{current_project, expanded_cwd, local_dir}]
       end
 
-    dirs
-    |> Enum.flat_map(fn dir ->
+    sources
+    |> Enum.uniq_by(fn {_proj, _root, dir} -> Path.expand(dir) end)
+    |> Enum.flat_map(fn {project_label, project_root, dir} ->
       if File.dir?(dir) do
         case File.ls(dir) do
           {:ok, files} ->
@@ -335,21 +444,23 @@ defmodule Yoke.CLI.ConfigExplorer do
                 {:ok, stat} ->
                   id = String.replace(file, ~r/\.(lmml|lmmlz)$/, "")
 
+                  base = %{
+                    id: id,
+                    file: file,
+                    path: full_path,
+                    size: stat.size,
+                    mtime: stat.mtime,
+                    timestamp: format_timestamp(stat.mtime),
+                    project: project_label,
+                    project_path: project_root
+                  }
+
                   meta =
                     if Keyword.get(opts, :metadata?, true),
                       do: parse_session_metadata(full_path),
                       else: %{model: "not loaded", msg_count: 0, preview: "(open to inspect)"}
 
-                  [
-                    Map.merge(meta, %{
-                      id: id,
-                      file: file,
-                      path: full_path,
-                      size: stat.size,
-                      mtime: stat.mtime,
-                      timestamp: format_timestamp(stat.mtime)
-                    })
-                  ]
+                  [merge_session_metadata(base, meta)]
 
                 _ ->
                   []
@@ -363,59 +474,185 @@ defmodule Yoke.CLI.ConfigExplorer do
         []
       end
     end)
-    |> Enum.uniq_by(& &1.path)
+    |> Enum.uniq_by(&Path.expand(&1.path))
     |> Enum.sort_by(& &1.mtime, :desc)
   end
 
+  @listing_header_bytes 8_192
+  @legacy_full_read_limit 512_000
+  @legacy_head_bytes 65_536
+
   def parse_session_metadata(path) do
-    if File.exists?(path) and String.ends_with?(path, ".lmml") do
+    cond do
+      not File.exists?(path) ->
+        %{model: "unknown", msg_count: 0, preview: "(unreadable)"}
+
+      String.ends_with?(path, ".lmml") ->
+        parse_lmml_metadata(path)
+
+      true ->
+        %{model: "lmmlz", msg_count: 0, preview: "(compressed session container)"}
+    end
+  end
+
+  defp parse_lmml_metadata(path) do
+    case read_file_prefix(path, @listing_header_bytes) do
+      {:ok, head} ->
+        case extract_listing_embed(head) do
+          {:ok, meta} ->
+            meta
+
+          :error ->
+            parse_legacy_lmml_metadata(path, head)
+        end
+
+      :error ->
+        %{model: "unknown", msg_count: 0, preview: "(unreadable)"}
+    end
+  end
+
+  defp read_file_prefix(path, max_bytes) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case :file.read(fd, max_bytes) do
+            {:ok, data} -> {:ok, data}
+            :eof -> {:ok, ""}
+            _ -> :error
+          end
+        after
+          :file.close(fd)
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp extract_listing_embed(head) do
+    case Regex.run(~r/^@@@listing\.json\r?\n(.*?)\r?\n@@@/ms, head) do
+      [_, json] ->
+        case Yoke.Json.decode(json) do
+          {:ok, %{} = data} ->
+            model = Map.get(data, "model") || "deepseek-flash"
+
+            msg_count =
+              case Map.get(data, "message_count") do
+                n when is_integer(n) and n >= 0 -> n
+                _ -> 0
+              end
+
+            preview =
+              case Map.get(data, "title") do
+                title when is_binary(title) and title != "" ->
+                  title |> String.replace(~r/[\r\n\t]+/, " ") |> String.trim()
+
+                _ ->
+                  "(session narrative)"
+              end
+
+            meta = %{model: model, msg_count: msg_count, preview: preview}
+
+            meta =
+              case Map.get(data, "project") do
+                project when is_binary(project) and project != "" ->
+                  Map.put(meta, :project, project)
+
+                _ ->
+                  case Map.get(data, "cwd") do
+                    cwd when is_binary(cwd) and cwd != "" ->
+                      Map.put(meta, :project, SessionMetadata.project_name_for_cwd(cwd))
+
+                    _ ->
+                      meta
+                  end
+              end
+
+            {:ok, meta}
+
+          _ ->
+            :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_legacy_lmml_metadata(path, head) do
+    size =
+      case File.stat(path) do
+        {:ok, %{size: s}} -> s
+        _ -> 0
+      end
+
+    if size <= @legacy_full_read_limit do
       case File.read(path) do
-        {:ok, content} ->
-          model =
-            case Regex.run(~r/"model"\s*:\s*"([^"]+)"/, content) do
-              [_, m] -> m
-              _ -> "deepseek-flash"
-            end
-
-          msg_count = Regex.scan(~r/^# (User|Assistant|Tool Call)/m, content) |> length()
-
-          preview =
-            case Regex.run(~r/# User\s+([^\r\n#]+)/m, content) do
-              [_, p] ->
-                String.trim(p)
-
-              _ ->
-                case SessionLmml.decode(content) do
-                  {:ok, data} when is_map(data) ->
-                    msgs = Map.get(data, "messages") || Map.get(data, :messages) || []
-
-                    user_msg =
-                      Enum.find(msgs, fn m ->
-                        to_string(Map.get(m, "role") || Map.get(m, :role)) == "user"
-                      end)
-
-                    if user_msg do
-                      cnt =
-                        Map.get(user_msg, "content") || Map.get(user_msg, :content) ||
-                          Map.get(user_msg, "text")
-
-                      to_string(cnt || "") |> String.replace(~r/[\r\n\t]+/, " ") |> String.trim()
-                    else
-                      "(session narrative)"
-                    end
-
-                  _ ->
-                    "(session narrative)"
-                end
-            end
-
-          %{model: model, msg_count: max(msg_count, 1), preview: preview}
-
-        _ ->
-          %{model: "unknown", msg_count: 0, preview: "(unreadable)"}
+        {:ok, content} -> parse_legacy_lmml_content(content, true)
+        _ -> %{model: "unknown", msg_count: 0, preview: "(unreadable)"}
       end
     else
-      %{model: "lmmlz", msg_count: 0, preview: "(compressed session container)"}
+      sample =
+        case read_file_prefix(path, @legacy_head_bytes) do
+          {:ok, chunk} -> chunk
+          :error -> head
+        end
+
+      parse_legacy_lmml_content(sample, false)
+    end
+  end
+
+  defp parse_legacy_lmml_content(content, decode_fallback?) do
+    model =
+      case Regex.run(~r/"model"\s*:\s*"([^"]+)"/, content) do
+        [_, m] -> m
+        _ -> "deepseek-flash"
+      end
+
+    msg_count =
+      Regex.scan(~r/^# (User|Assistant|Tool Call)|^## (USER|ASSISTANT|TOOL)\b/m, content)
+      |> length()
+
+    preview =
+      cond do
+        match = Regex.run(~r/^# User\s+([^\r\n#]+)/m, content) ->
+          match |> Enum.at(1) |> String.trim()
+
+        match = Regex.run(~r/^## USER\r?\n+\s*([^\r\n#@]+)/m, content) ->
+          match |> Enum.at(1) |> String.trim()
+
+        decode_fallback? ->
+          decode_preview_fallback(content)
+
+        true ->
+          "(session narrative)"
+      end
+
+    %{model: model, msg_count: max(msg_count, 1), preview: preview}
+  end
+
+  defp decode_preview_fallback(content) do
+    case SessionLmml.decode(content) do
+      {:ok, data} when is_map(data) ->
+        msgs = Map.get(data, "messages") || Map.get(data, :messages) || []
+
+        user_msg =
+          Enum.find(msgs, fn m ->
+            to_string(Map.get(m, "role") || Map.get(m, :role)) == "user"
+          end)
+
+        if user_msg do
+          cnt =
+            Map.get(user_msg, "content") || Map.get(user_msg, :content) ||
+              Map.get(user_msg, "text")
+
+          to_string(cnt || "") |> String.replace(~r/[\r\n\t]+/, " ") |> String.trim()
+        else
+          "(session narrative)"
+        end
+
+      _ ->
+        "(session narrative)"
     end
   end
 
@@ -719,8 +956,10 @@ defmodule Yoke.CLI.ConfigExplorer do
       detail_scroll: 0,
       status_notice: nil,
       load_options: opts,
+      show_all_sessions?: show_all_sessions_opt(opts),
       load_ref: nil,
       loader_pid: nil,
+      sessions_loader_pid: nil,
       loading: Map.new(@tabs, &{&1, :pending})
     }
   end
@@ -1315,10 +1554,18 @@ defmodule Yoke.CLI.ConfigExplorer do
     footer_text =
       case state.view_mode do
         :list ->
-          if state.active_tab == :sessions and
-               Map.get(state.tree, :sessions_total, 0) >
+          if state.active_tab == :sessions do
+            toggle_hint =
+              if Map.get(state, :show_all_sessions?, false),
+                do: "s: Project Only",
+                else: "s: Show All"
+
+            if Map.get(state.tree, :sessions_total, 0) >
                  Map.get(state.tree, :sessions_page_size, viewport_rows) do
-            "[Tab/1-8: Tab | ↑/↓: Select | PgUp/PgDn or p/n: Page | Enter: Detail | d: Delete | r: Refresh | q: Exit]"
+              "[Tab/1-8: Tab | ↑/↓: Select | PgUp/PgDn or p/n: Page | #{toggle_hint} | Enter: Detail | d: Delete | r: Refresh | q: Exit]"
+            else
+              "[Tab/1-8: Tab | ↑/↓: Select | #{toggle_hint} | Enter: Detail | d: Delete | r: Refresh | q: Exit]"
+            end
           else
             "[Tab/1-8: Tab | ↑/↓: Select | Enter: Expand/Detail | Space: Toggle | a: Add Rule | d: Delete | r: Refresh | q: Exit]"
           end
@@ -1364,6 +1611,67 @@ defmodule Yoke.CLI.ConfigExplorer do
   # ---------------------------------------------------------------------
   # List Viewport Renderer
   # ---------------------------------------------------------------------
+
+  defp render_list_viewport(%{active_tab: :sessions} = state, cols, height, theme) do
+    items = fetch_tab_items(state)
+    show_all? = Map.get(state, :show_all_sessions?, false)
+    current_project = SessionMetadata.project_name_for_cwd(state.cwd)
+
+    toolbar_content =
+      if show_all? do
+        "  Scope: #{Formatter.bold()}All projects#{Formatter.reset()}   #{theme.pill_bg} Show All: ON #{Formatter.reset()} #{Formatter.dim()}[s: Current Project]#{Formatter.reset()}"
+      else
+        "  Scope: #{Formatter.bold()}#{current_project}#{Formatter.reset()} #{Formatter.dim()}(current project)#{Formatter.reset()}   #{theme.pill_bg} [s] Show All #{Formatter.reset()}"
+      end
+
+    toolbar_row = format_box_row(toolbar_content, cols, theme.border)
+
+    col_header_content =
+      "#{Formatter.bold()}#{Formatter.dim()}   " <>
+        "#{pad_col("Project", 14)}  " <>
+        "#{pad_col("ID", 18)}  " <>
+        "#{pad_col("Updated", 16)}  " <>
+        "#{pad_col("Model", 15)}  " <>
+        "#{String.pad_leading("Msgs", 4)}  " <>
+        "#{String.pad_leading("Size", 8)}  " <>
+        "Preview#{Formatter.reset()}"
+
+    col_header_row = format_box_row(col_header_content, cols, theme.border)
+
+    if items == [] do
+      empty_msg =
+        if show_all?,
+          do: "  (No conversations found across any project)",
+          else: "  (No conversations found for '#{current_project}' — press 's' for Show All)"
+
+      [toolbar_row, col_header_row, format_box_row(empty_msg, cols, theme.border)] ++
+        pad_empty_rows(height - 3, cols, theme.border)
+    else
+      list_height = max(1, height - 2)
+      total_items = length(items)
+      cursor = min(state.cursor, total_items - 1)
+
+      start_idx =
+        cond do
+          cursor < list_height -> 0
+          cursor >= total_items - list_height -> max(0, total_items - list_height)
+          true -> cursor - div(list_height, 2)
+        end
+
+      visible_items = Enum.slice(items, start_idx, list_height)
+
+      rows =
+        visible_items
+        |> Enum.with_index(start_idx)
+        |> Enum.map(fn {item, idx} ->
+          is_selected = idx == cursor
+          format_item_row(:sessions, item, is_selected, cols, theme)
+        end)
+
+      remaining = list_height - length(rows)
+      [toolbar_row, col_header_row] ++ rows ++ pad_empty_rows(remaining, cols, theme.border)
+    end
+  end
 
   defp render_list_viewport(state, cols, height, theme) do
     items = fetch_tab_items(state)
@@ -1517,16 +1825,24 @@ defmodule Yoke.CLI.ConfigExplorer do
 
   defp format_item_row(:sessions, sess, is_selected, cols, theme) do
     size_kb = Float.round(sess.size / 1024, 1)
+    project = Map.get(sess, :project, "unknown")
     model = Map.get(sess, :model, "deepseek-flash")
     msg_cnt = Map.get(sess, :msg_count, 0)
     preview = Map.get(sess, :preview, "")
-    ts = Map.get(sess, :timestamp, "")
+    ts = sess |> Map.get(:timestamp, "") |> String.slice(0, 16)
+
+    proj_col = pad_col(project, 14)
+    id_col = pad_col(to_string(sess.id), 18)
+    ts_col = pad_col(ts, 16)
+    model_col = pad_col(to_string(model), 15)
+    msgs_col = msg_cnt |> to_string() |> String.pad_leading(4)
+    size_col = "#{size_kb} KB" |> String.pad_leading(8)
 
     content =
       if is_selected do
-        "#{theme.bold_cursor} ❯ #{sess.id} #{Formatter.reset()}#{Formatter.yellow()}[#{ts}]#{Formatter.reset()} #{Formatter.cyan()}[#{model}] #{msg_cnt} msgs (#{size_kb} KB) - \"#{preview}\"#{Formatter.reset()}"
+        "#{theme.bold_cursor} ❯ #{Formatter.green()}#{proj_col}#{Formatter.reset()}  #{theme.bold_cursor}#{id_col}#{Formatter.reset()}  #{Formatter.yellow()}#{ts_col}#{Formatter.reset()}  #{Formatter.cyan()}#{model_col}  #{msgs_col}  #{size_col}  \"#{preview}\"#{Formatter.reset()}"
       else
-        "   #{sess.id} #{Formatter.dim()}[#{ts}] [#{model}] #{msg_cnt} msgs (#{size_kb} KB) - \"#{preview}\"#{Formatter.reset()}"
+        "   #{Formatter.cyan()}#{proj_col}#{Formatter.reset()}  #{id_col}  #{Formatter.dim()}#{ts_col}  #{model_col}  #{msgs_col}  #{size_col}  \"#{preview}\"#{Formatter.reset()}"
       end
 
     format_box_row(content, cols, theme.border)
@@ -1693,6 +2009,19 @@ defmodule Yoke.CLI.ConfigExplorer do
     format_box_row(content, cols, theme.border)
   end
 
+  defp pad_col(str, width) when is_binary(str) and is_integer(width) and width > 1 do
+    safe = Formatter.sanitize_utf8(str)
+    len = String.length(safe)
+
+    cond do
+      len == width -> safe
+      len < width -> safe <> String.duplicate(" ", width - len)
+      true -> String.slice(safe, 0, width - 1) <> "…"
+    end
+  end
+
+  defp pad_col(other, width), do: pad_col(to_string(other || ""), width)
+
   # ---------------------------------------------------------------------
   # Expandable Detail Viewport Renderer
   # ---------------------------------------------------------------------
@@ -1781,6 +2110,7 @@ defmodule Yoke.CLI.ConfigExplorer do
 
     header = [
       "Session ID:   #{sess.id}",
+      "Project:      #{Map.get(sess, :project, "unknown")}",
       "File Path:    #{sess.path}",
       "File Size:    #{sess.size} bytes",
       "Model:        #{Map.get(sess, :model, "deepseek-flash")}",
@@ -2250,36 +2580,29 @@ defmodule Yoke.CLI.ConfigExplorer do
         tui_loop(move_cursor(state, 1), input)
 
       :page_up ->
-        if state.active_tab == :sessions and state.view_mode == :list and
-             sessions_has_prev?(state) do
-          tui_loop(page_sessions(state, :prev), input)
-        else
-          tui_loop(move_cursor(state, -10), input)
-        end
+        if can_page_sessions?(state, :prev),
+          do: tui_loop(page_sessions(state, :prev), input),
+          else: tui_loop(move_cursor(state, -10), input)
 
       :page_down ->
-        if state.active_tab == :sessions and state.view_mode == :list and
-             sessions_has_next?(state) do
-          tui_loop(page_sessions(state, :next), input)
-        else
-          tui_loop(move_cursor(state, 10), input)
-        end
+        if can_page_sessions?(state, :next),
+          do: tui_loop(page_sessions(state, :next), input),
+          else: tui_loop(move_cursor(state, 10), input)
 
       {:char, ?n} ->
-        if state.active_tab == :sessions and state.view_mode == :list and
-             sessions_has_next?(state) do
-          tui_loop(page_sessions(state, :next), input)
-        else
-          tui_loop(state, input)
-        end
+        if can_page_sessions?(state, :next),
+          do: tui_loop(page_sessions(state, :next), input),
+          else: tui_loop(state, input)
 
       {:char, ?p} ->
-        if state.active_tab == :sessions and state.view_mode == :list and
-             sessions_has_prev?(state) do
-          tui_loop(page_sessions(state, :prev), input)
-        else
-          tui_loop(state, input)
-        end
+        if can_page_sessions?(state, :prev),
+          do: tui_loop(page_sessions(state, :prev), input),
+          else: tui_loop(state, input)
+
+      {:char, c} when c in [?s, ?S] ->
+        if state.active_tab == :sessions and state.view_mode == :list,
+          do: tui_loop(toggle_show_all_sessions(state), input),
+          else: tui_loop(state, input)
 
       :home ->
         tui_loop(%{state | cursor: 0, detail_scroll: 0}, input)
